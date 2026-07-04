@@ -1,0 +1,27 @@
+# Non-secret defaults. Secrets (API keys) live in .env, never here.
+
+chunk_token_budget: 3000
+max_retries: 3
+on_error: abort   # abort | skip
+temperature: 0.2
+timeout_s: 60.0
+
+output_pattern: "{stem}.{target_lang}{ext}"
+
+providers:
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "llama3.1"
+  openai:
+    model: "gpt-4o-mini"
+  anthropic:
+    model: "claude-sonnet-5"
+  thaillm:
+    base_url: "https://thaillm.or.th"
+    chat_path: "/v1/chat/completions"
+    model: "thaillm-default"
+
+fonts:
+  th: "assets/fonts/NotoSansThai-Regular.ttf"
+  ja: "assets/fonts/NotoSansJP-Regular.ttf"
+  en: "assets/fonts/NotoSansJP-Regular.ttf"

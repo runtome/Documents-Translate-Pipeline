@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.env
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
+
+# fetched by scripts/fetch_fonts.py, not committed (large binaries)
+assets/fonts/*.ttf
