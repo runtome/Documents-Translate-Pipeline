@@ -12,3 +12,6 @@ build/
 
 # fetched by scripts/fetch_fonts.py, not committed (large binaries)
 assets/fonts/*.ttf
+
+# per-run debug logs (see src/doctranslate/logging_utils.py)
+logs/
