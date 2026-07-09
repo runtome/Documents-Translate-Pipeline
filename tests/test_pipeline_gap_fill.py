@@ -120,11 +120,13 @@ def test_gap_fill_recovers_from_a_malformed_response_with_an_unclosed_trailing_t
 
 
 class CorruptedMergeClient(LLMClient):
-    """Leaves a *non-trailing* <SEG> tag unclosed, so the parser's non-greedy
-    match swallows the next tag's opener into this segment's content before
-    finding a real closing tag - producing a corrupted (not merely missing)
-    value. This must NOT be silently gap-filled, since we can't trust which id
-    actually owns that content.
+    """Leaves a *non-trailing* <SEG> tag unclosed whenever given 2+ segments, so
+    the parser's non-greedy match swallows the next tag's opener into this
+    segment's content before finding a real closing tag - producing a
+    corrupted (not merely missing) value every time, even on a narrowed-down
+    retry. This deterministic, never-shrinking corruption should stay
+    unrecoverable (the retry set can't shrink below the full remaining batch,
+    so the safety guard against unproductive re-requests should kick in).
     """
 
     def __init__(self):
@@ -144,7 +146,7 @@ class CorruptedMergeClient(LLMClient):
         return "\n".join(parts)
 
 
-def test_corrupted_merge_from_a_non_trailing_unclosed_tag_is_not_gap_filled(tmp_path):
+def test_persistently_corrupted_merge_is_not_gap_filled_forever(tmp_path):
     src = tmp_path / "sample.docx"
     doc = Document()
     for i in range(3):
@@ -155,3 +157,43 @@ def test_corrupted_merge_from_a_non_trailing_unclosed_tag_is_not_gap_filled(tmp_
 
     with pytest.raises(ChunkProcessingError):
         run_pipeline(str(src), "en", "th", client, max_retries=1)
+
+
+class CorruptedMergeThenRecoversClient(LLMClient):
+    """Only corrupts (merges the first tag into the second's close) for
+    batches of 3+ segments; translates cleanly for smaller batches -
+    simulating a small model that trips over its own tag structure on longer
+    runs but succeeds once gap-fill narrows the retry down to just the
+    affected ids (a realistic, non-adversarial version of the corrupted-merge
+    failure mode).
+    """
+
+    def __init__(self):
+        super().__init__(LLMConfig(provider="fake", model="fake"))
+
+    def translate_chunk(self, system_prompt: str, user_prompt: str) -> str:
+        matches = _SEG_PATTERN.findall(user_prompt)
+        if len(matches) < 3:
+            return "\n".join(f'<SEG id="{seg_id}">[TR]{text}</SEG>' for seg_id, text in matches)
+        parts = []
+        for i, (seg_id, text) in enumerate(matches):
+            if i == 0:
+                parts.append(f'<SEG id="{seg_id}">[TR]{text}')  # unclosed, not last
+            else:
+                parts.append(f'<SEG id="{seg_id}">[TR]{text}</SEG>')
+        return "\n".join(parts)
+
+
+def test_gap_fill_recovers_by_quarantining_a_corrupted_value_and_retrying_it_too(tmp_path):
+    src = tmp_path / "sample.docx"
+    doc = Document()
+    for i in range(4):
+        doc.add_paragraph(f"Paragraph {i}")
+    doc.save(src)
+
+    client = CorruptedMergeThenRecoversClient()
+    out_path = run_pipeline(str(src), "en", "th", client, max_retries=1)
+
+    out_doc = Document(str(out_path))
+    out_texts = [p.text for p in out_doc.paragraphs if p.text.strip()]
+    assert out_texts == [f"[TR]Paragraph {i}" for i in range(4)]

@@ -56,7 +56,7 @@ Options:
 | `--temperature FLOAT` | Sampling temperature |
 | `--glossary PATH` | JSON file of `{"source term": "target term"}` for consistent terminology |
 | `--dry-run` | Extract and chunk only; print segment/chunk/token counts without calling any provider |
-| `-v` / `--verbose` | Debug logging |
+| `-v` / `--verbose` | Debug logging, including each segment's source text and its translation as they're received |
 
 Check provider connectivity and font availability:
 

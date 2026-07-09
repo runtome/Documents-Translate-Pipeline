@@ -58,20 +58,36 @@ def _translate_segments(
     user_prompt = build_user_prompt(segments, aliases)
 
     translated = translate_chunk_with_retry(client, system_prompt, user_prompt, aliases, max_retries=max_retries)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        for seg, alias in zip(segments, aliases):
+            if alias in translated:
+                logger.debug("SEG %s BEFORE: %s", alias, seg.source_text)
+                logger.debug("SEG %s AFTER:  %s", alias, translated[alias])
+
     return {alias_to_segment_id[alias]: text for alias, text in translated.items()}
 
 
-def _looks_corrupted(translations: dict[str, str]) -> bool:
-    """A response with an unclosed `<SEG id="...">` tag is flagged malformed, but
+def _quarantine_corrupted(translations: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Split out any translations whose value contains a stray `<seg`.
+
+    A response with an unclosed `<SEG id="...">` tag is flagged malformed, but
     the regex that parses it can go one of two ways: the unclosed id simply
     produces no match (safe — it just shows up as "missing"), or its content
     swallows a later tag's `<SEG id="...">` opener too before matching the
     later tag's `</SEG>` (unsafe — the earlier id's value is now corrupted and
     the later id vanishes from the response entirely without going "missing").
-    A stray `<seg` inside an otherwise-parsed value is the signature of the
-    second, unsafe case.
+    Rather than distrust the whole chunk, treat a corrupted id the same as a
+    missing one — drop it from the trusted set and let gap-fill retry it too.
     """
-    return any("<seg" in text.lower() for text in translations.values())
+    clean: dict[str, str] = {}
+    corrupted_ids: list[str] = []
+    for alias, text in translations.items():
+        if "<seg" in text.lower():
+            corrupted_ids.append(alias)
+        else:
+            clean[alias] = text
+    return clean, corrupted_ids
 
 
 def _translate_with_gap_fill(
@@ -84,34 +100,32 @@ def _translate_with_gap_fill(
 ) -> tuple[dict[str, str], Optional[Exception]]:
     """Translate a group of segments; on a partial miss, retry only the missing ones.
 
-    A chunk that comes back with a handful of ids missing (but none extra, and
-    none of the successfully-parsed translations corrupted) shouldn't sacrifice
-    the rest of a large, otherwise-successful chunk just to satisfy an
-    all-or-nothing retry. This also covers the common small-model failure mode
-    of leaving one `<SEG id="...">` tag unclosed (flagged as malformed) while
-    every other tag in the same chunk parses cleanly. Retrying a tiny follow-up
-    request for just the missing segments is both cheap and, empirically, far
-    more reliable for small local models than re-sending the whole chunk again.
+    A chunk that comes back with a handful of ids missing or corrupted (but
+    none extra) shouldn't sacrifice the rest of a large, otherwise-successful
+    chunk just to satisfy an all-or-nothing retry. This also covers the common
+    small-model failure mode of leaving a `<SEG id="...">` tag unclosed
+    (flagged as malformed) while every other tag in the same chunk parses
+    cleanly. Retrying a tiny follow-up request for just the missing/corrupted
+    segments is both cheap and, empirically, far more reliable for small local
+    models than re-sending the whole chunk again.
     """
     try:
         return _translate_segments(client, source_lang, target_lang, glossary, segments, max_retries), None
     except ChunkValidationError as exc:
         result = exc.validation_result
-        eligible_for_gap_fill = (
-            result.missing_ids
-            and not result.extra_ids
-            and len(result.missing_ids) < len(segments)
-            and not _looks_corrupted(result.translations)
-        )
+        clean_translations, corrupted_ids = _quarantine_corrupted(result.translations)
+        retry_ids = sorted(set(result.missing_ids) | set(corrupted_ids), key=int)
+
+        eligible_for_gap_fill = retry_ids and not result.extra_ids and len(retry_ids) < len(segments)
         if not eligible_for_gap_fill:
             return {}, exc
 
         segment_by_alias = {str(idx): seg for idx, seg in enumerate(segments, start=1)}
-        partial = {segment_by_alias[alias].id: text for alias, text in result.translations.items()}
-        missing_segments = [segment_by_alias[alias] for alias in result.missing_ids]
+        partial = {segment_by_alias[alias].id: text for alias, text in clean_translations.items()}
+        missing_segments = [segment_by_alias[alias] for alias in retry_ids]
 
         logger.warning(
-            "%d/%d segments missing after retries; retrying just the missing ones",
+            "%d/%d segments missing or corrupted after retries; retrying just those",
             len(missing_segments),
             len(segments),
         )
