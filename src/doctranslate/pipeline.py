@@ -65,29 +65,10 @@ def _translate_segments(
                 logger.debug("SEG %s BEFORE: %s", alias, seg.source_text)
                 logger.debug("SEG %s AFTER:  %s", alias, translated[alias])
 
-    return {alias_to_segment_id[alias]: text for alias, text in translated.items()}
-
-
-def _quarantine_corrupted(translations: dict[str, str]) -> tuple[dict[str, str], list[str]]:
-    """Split out any translations whose value contains a stray `<seg`.
-
-    A response with an unclosed `<SEG id="...">` tag is flagged malformed, but
-    the regex that parses it can go one of two ways: the unclosed id simply
-    produces no match (safe — it just shows up as "missing"), or its content
-    swallows a later tag's `<SEG id="...">` opener too before matching the
-    later tag's `</SEG>` (unsafe — the earlier id's value is now corrupted and
-    the later id vanishes from the response entirely without going "missing").
-    Rather than distrust the whole chunk, treat a corrupted id the same as a
-    missing one — drop it from the trusted set and let gap-fill retry it too.
-    """
-    clean: dict[str, str] = {}
-    corrupted_ids: list[str] = []
-    for alias, text in translations.items():
-        if "<seg" in text.lower():
-            corrupted_ids.append(alias)
-        else:
-            clean[alias] = text
-    return clean, corrupted_ids
+    # An unrequested extra alias (e.g. a small model inventing one extra
+    # numbered entry) has no segment to write back to — drop it rather than
+    # letting the lookup below raise.
+    return {alias_to_segment_id[alias]: text for alias, text in translated.items() if alias in alias_to_segment_id}
 
 
 def _translate_with_gap_fill(
@@ -100,27 +81,74 @@ def _translate_with_gap_fill(
 ) -> tuple[dict[str, str], Optional[Exception]]:
     """Translate a group of segments; on a partial miss, retry only the missing ones.
 
-    A chunk that comes back with a handful of ids missing or corrupted (but
-    none extra) shouldn't sacrifice the rest of a large, otherwise-successful
-    chunk just to satisfy an all-or-nothing retry. This also covers the common
-    small-model failure mode of leaving a `<SEG id="...">` tag unclosed
-    (flagged as malformed) while every other tag in the same chunk parses
-    cleanly. Retrying a tiny follow-up request for just the missing/corrupted
+    A chunk that comes back with a handful of ids missing or corrupted
+    shouldn't sacrifice the rest of a large, otherwise-successful chunk just
+    to satisfy an all-or-nothing retry. This also covers the common
+    small-model failure mode of leaving a `<SEG id="...">` tag unclosed, which
+    can corrupt one id's value while another vanishes entirely (see
+    validator.py) — both are treated the same as "missing" here. Any extra,
+    unrequested ids are simply discarded (they have no segment to write back
+    to). Retrying a tiny follow-up request for just the missing/corrupted
     segments is both cheap and, empirically, far more reliable for small local
     models than re-sending the whole chunk again.
+
+    If literally every segment in the batch failed, re-sending the identical
+    batch would just reproduce the same failure — some models simply choke on
+    a batch above a certain size, even though they handle smaller ones fine.
+    In that case, split the batch in half and retry each half independently
+    (recursing further if a half still fails outright), rather than giving up
+    on the whole thing. This bottoms out at single-segment requests, which are
+    the most reliable size for any model.
     """
     try:
         return _translate_segments(client, source_lang, target_lang, glossary, segments, max_retries), None
     except ChunkValidationError as exc:
         result = exc.validation_result
-        clean_translations, corrupted_ids = _quarantine_corrupted(result.translations)
-        retry_ids = sorted(set(result.missing_ids) | set(corrupted_ids), key=int)
+        segment_by_alias = {str(idx): seg for idx, seg in enumerate(segments, start=1)}
+        # `corrupted_ids` (unlike `missing_ids`) isn't guaranteed to be a subset
+        # of the expected aliases for this batch — a stray non-numeric id (e.g.
+        # a model echoing a literal "..." placeholder from the prompt's example
+        # format) can show up flagged as corrupted too. Intersect with the
+        # actual expected aliases so a bogus id can't reach `key=int` below or
+        # be mistaken for a real segment needing retry.
+        retry_ids = sorted(
+            (set(result.missing_ids) | set(result.corrupted_ids)) & segment_by_alias.keys(), key=int
+        )
 
-        eligible_for_gap_fill = retry_ids and not result.extra_ids and len(retry_ids) < len(segments)
-        if not eligible_for_gap_fill:
+        if not retry_ids:
             return {}, exc
 
-        segment_by_alias = {str(idx): seg for idx, seg in enumerate(segments, start=1)}
+        if len(retry_ids) == len(segments):
+            if len(segments) == 1:
+                # nothing more can be tried — log the actual content so a
+                # persistent per-segment failure (as opposed to a batch-size
+                # problem) is diagnosable rather than just an opaque id.
+                logger.warning(
+                    "segment could not be translated even in isolation after %d retries "
+                    "and will be left untranslated if --on-error skip is set: %s",
+                    max_retries,
+                    segments[0].source_text,
+                )
+                return {}, exc  # a single segment that still can't be recovered
+
+            mid = len(segments) // 2
+            logger.warning(
+                "all %d segments failed as one batch; splitting into %d + %d and retrying",
+                len(segments), mid, len(segments) - mid,
+            )
+            first_result, first_error = _translate_with_gap_fill(
+                client, source_lang, target_lang, glossary, segments[:mid], max_retries
+            )
+            second_result, second_error = _translate_with_gap_fill(
+                client, source_lang, target_lang, glossary, segments[mid:], max_retries
+            )
+            return {**first_result, **second_result}, first_error or second_error
+
+        clean_translations = {
+            alias: text
+            for alias, text in result.translations.items()
+            if alias in segment_by_alias and alias not in result.corrupted_ids
+        }
         partial = {segment_by_alias[alias].id: text for alias, text in clean_translations.items()}
         missing_segments = [segment_by_alias[alias] for alias in retry_ids]
 

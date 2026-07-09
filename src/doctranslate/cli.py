@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,8 @@ from .glossary import load_glossary
 from .llm.factory import get_client
 from .logging_utils import configure_logging
 from .pipeline import dry_run_stats, run_pipeline
+
+logger = logging.getLogger(__name__)
 
 app = typer.Typer(add_completion=False)
 doctor_app = typer.Typer(add_completion=False)
@@ -62,11 +65,16 @@ def translate(
     src_lang = _normalize_lang(source_lang)
     tgt_lang = _normalize_lang(target_lang)
 
-    resolved_on_error = on_error or "abort"
+    settings = load_settings(str(config_path) if config_path else None)
+
+    # --on-error flag takes precedence over config/default.yaml's on_error key,
+    # which itself takes precedence over the hardcoded "abort" fallback -- same
+    # layering as every other setting here (CLI > config file > built-in default).
+    resolved_on_error = on_error or settings.get("on_error", "abort")
     if resolved_on_error not in ON_ERROR_CHOICES:
         raise typer.BadParameter(f"--on-error must be one of {sorted(ON_ERROR_CHOICES)}")
+    logger.info("on_error=%s (source: %s)", resolved_on_error, "flag" if on_error else "config/default")
 
-    settings = load_settings(str(config_path) if config_path else None)
     resolved_chunk_tokens = chunk_tokens or settings.get("chunk_token_budget", 3000)
     resolved_max_segments = max_segments_per_chunk or settings.get("max_segments_per_chunk", 40)
 

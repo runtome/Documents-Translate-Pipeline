@@ -123,10 +123,12 @@ class CorruptedMergeClient(LLMClient):
     """Leaves a *non-trailing* <SEG> tag unclosed whenever given 2+ segments, so
     the parser's non-greedy match swallows the next tag's opener into this
     segment's content before finding a real closing tag - producing a
-    corrupted (not merely missing) value every time, even on a narrowed-down
-    retry. This deterministic, never-shrinking corruption should stay
-    unrecoverable (the retry set can't shrink below the full remaining batch,
-    so the safety guard against unproductive re-requests should kick in).
+    corrupted (not merely missing) value every time it's given 2+ segments,
+    but translating cleanly for a single segment. Since the retry set here
+    never shrinks below the full remaining batch (quarantining "corrupts"
+    just relabels the same ids as "missing"), plain gap-fill alone can't
+    converge - it takes the split-in-half fallback bottoming out at
+    single-segment requests to fully recover this.
     """
 
     def __init__(self):
@@ -146,7 +148,7 @@ class CorruptedMergeClient(LLMClient):
         return "\n".join(parts)
 
 
-def test_persistently_corrupted_merge_is_not_gap_filled_forever(tmp_path):
+def test_split_in_half_fallback_recovers_a_never_shrinking_corruption(tmp_path):
     src = tmp_path / "sample.docx"
     doc = Document()
     for i in range(3):
@@ -154,9 +156,80 @@ def test_persistently_corrupted_merge_is_not_gap_filled_forever(tmp_path):
     doc.save(src)
 
     client = CorruptedMergeClient()
+    out_path = run_pipeline(str(src), "en", "th", client, max_retries=1)
+
+    out_doc = Document(str(out_path))
+    out_texts = [p.text for p in out_doc.paragraphs if p.text.strip()]
+    assert out_texts == [f"[TR]Paragraph {i}" for i in range(3)]
+
+
+class AlwaysFailsClient(LLMClient):
+    """Never produces a single valid <SEG> pair, regardless of batch size -
+    even a lone segment always comes back empty. This is the true
+    nothing-more-can-be-tried case that must still raise rather than split
+    or retry forever.
+    """
+
+    def __init__(self):
+        super().__init__(LLMConfig(provider="fake", model="fake"))
+
+    def translate_chunk(self, system_prompt: str, user_prompt: str) -> str:
+        return "no valid tags in this response at all"
+
+
+def test_client_that_always_fails_even_alone_is_not_retried_forever(tmp_path):
+    src = tmp_path / "sample.docx"
+    doc = Document()
+    for i in range(3):
+        doc.add_paragraph(f"Paragraph {i}")
+    doc.save(src)
+
+    client = AlwaysFailsClient()
 
     with pytest.raises(ChunkProcessingError):
         run_pipeline(str(src), "en", "th", client, max_retries=1)
+
+
+class FailsAboveThresholdClient(LLMClient):
+    """Returns a response with no valid tags at all whenever asked to
+    translate more than `threshold` segments at once; translates correctly
+    otherwise - simulating a small/weak model (or a model given too large a
+    chunk for its context/output window) that can't handle a big batch at
+    all, as opposed to just fumbling one or two ids within it.
+    """
+
+    def __init__(self, threshold: int = 2):
+        super().__init__(LLMConfig(provider="fake", model="fake"))
+        self.threshold = threshold
+        self.batch_sizes: list[int] = []
+
+    def translate_chunk(self, system_prompt: str, user_prompt: str) -> str:
+        matches = _SEG_PATTERN.findall(user_prompt)
+        self.batch_sizes.append(len(matches))
+        if len(matches) > self.threshold:
+            return "sorry, I can't do that many at once"
+        return "\n".join(f'<SEG id="{seg_id}">[TR]{text}</SEG>' for seg_id, text in matches)
+
+
+def test_total_batch_failure_is_recovered_by_splitting_in_half(tmp_path):
+    src = tmp_path / "sample.docx"
+    doc = Document()
+    for i in range(5):
+        doc.add_paragraph(f"Paragraph {i}")
+    doc.save(src)
+
+    client = FailsAboveThresholdClient(threshold=2)
+    out_path = run_pipeline(str(src), "en", "th", client, max_retries=1)
+
+    out_doc = Document(str(out_path))
+    out_texts = [p.text for p in out_doc.paragraphs if p.text.strip()]
+    assert out_texts == [f"[TR]Paragraph {i}" for i in range(5)]
+
+    # the initial full-size attempt fails outright, but every batch actually
+    # accepted (i.e. that produced output) is at or below the client's threshold
+    assert client.batch_sizes[0] == 5
+    accepted_sizes = [size for size in client.batch_sizes if size <= client.threshold]
+    assert accepted_sizes and max(accepted_sizes) <= 2
 
 
 class CorruptedMergeThenRecoversClient(LLMClient):
@@ -197,3 +270,86 @@ def test_gap_fill_recovers_by_quarantining_a_corrupted_value_and_retrying_it_too
     out_doc = Document(str(out_path))
     out_texts = [p.text for p in out_doc.paragraphs if p.text.strip()]
     assert out_texts == [f"[TR]Paragraph {i}" for i in range(4)]
+
+
+class InventsOneExtraSegmentClient(LLMClient):
+    """Always returns every requested segment correctly, plus one bonus,
+    unrequested id past the end of the batch - simulating a small model that
+    hallucinates one extra numbered entry that doesn't exist in the source.
+    """
+
+    def __init__(self):
+        super().__init__(LLMConfig(provider="fake", model="fake"))
+        self.call_count = 0
+
+    def translate_chunk(self, system_prompt: str, user_prompt: str) -> str:
+        self.call_count += 1
+        matches = _SEG_PATTERN.findall(user_prompt)
+        parts = [f'<SEG id="{seg_id}">[TR]{text}</SEG>' for seg_id, text in matches]
+        bonus_id = str(len(matches) + 1)
+        parts.append(f'<SEG id="{bonus_id}">[TR]hallucinated content</SEG>')
+        return "\n".join(parts)
+
+
+def test_harmless_extra_id_is_discarded_without_retrying_or_aborting(tmp_path):
+    src = tmp_path / "sample.docx"
+    doc = Document()
+    for i in range(3):
+        doc.add_paragraph(f"Paragraph {i}")
+    doc.save(src)
+
+    client = InventsOneExtraSegmentClient()
+    out_path = run_pipeline(str(src), "en", "th", client)
+
+    out_doc = Document(str(out_path))
+    out_texts = [p.text for p in out_doc.paragraphs if p.text.strip()]
+    assert out_texts == [f"[TR]Paragraph {i}" for i in range(3)]
+    assert client.call_count == 1
+
+
+class HallucinatesCorruptedPlaceholderIdClient(LLMClient):
+    """Translates every real segment correctly, but also appends a bogus
+    non-numeric id (e.g. a model echoing a literal "..." placeholder from the
+    prompt's example format) whose own content happens to look corrupted -
+    this must not crash `sorted(..., key=int)` and must not be treated as a
+    reason to distrust the otherwise-complete response.
+    """
+
+    def __init__(self):
+        super().__init__(LLMConfig(provider="fake", model="fake"))
+
+    def translate_chunk(self, system_prompt: str, user_prompt: str) -> str:
+        matches = _SEG_PATTERN.findall(user_prompt)
+        parts = [f'<SEG id="{seg_id}">[TR]{text}</SEG>' for seg_id, text in matches]
+        parts.append('<SEG id="...">junk <SEG more junk</SEG>')
+        return "\n".join(parts)
+
+
+def test_non_numeric_corrupted_placeholder_id_does_not_crash_or_fail(tmp_path):
+    src = tmp_path / "sample.docx"
+    doc = Document()
+    for i in range(2):
+        doc.add_paragraph(f"Paragraph {i}")
+    doc.save(src)
+
+    client = HallucinatesCorruptedPlaceholderIdClient()
+    out_path = run_pipeline(str(src), "en", "th", client)
+
+    out_doc = Document(str(out_path))
+    out_texts = [p.text for p in out_doc.paragraphs if p.text.strip()]
+    assert out_texts == ["[TR]Paragraph 0", "[TR]Paragraph 1"]
+
+
+def test_persistently_failing_single_segment_logs_its_source_text(tmp_path, caplog):
+    src = tmp_path / "sample.docx"
+    doc = Document()
+    doc.add_paragraph("A stubborn paragraph that the model refuses to translate")
+    doc.save(src)
+
+    client = AlwaysFailsClient()
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(ChunkProcessingError):
+            run_pipeline(str(src), "en", "th", client, on_error="abort", max_retries=1)
+
+    assert "A stubborn paragraph that the model refuses to translate" in caplog.text

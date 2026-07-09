@@ -15,3 +15,6 @@ assets/fonts/*.ttf
 
 # per-run debug logs (see src/doctranslate/logging_utils.py)
 logs/
+
+#Translation files
+documents/
