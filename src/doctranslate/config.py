@@ -11,6 +11,7 @@ DEFAULT_CONFIG_PATH = Path("config/default.yaml")
 
 DEFAULTS: dict[str, Any] = {
     "chunk_token_budget": 3000,
+    "max_segments_per_chunk": 40,
     "max_retries": 3,
     "on_error": "abort",
     "temperature": 0.2,

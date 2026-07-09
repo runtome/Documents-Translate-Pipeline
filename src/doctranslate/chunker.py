@@ -3,6 +3,10 @@ import logging
 from .models import Segment
 
 TAG_OVERHEAD = 15
+# Independent of token budget: weaker LLMs (esp. small local models) start dropping,
+# merging, or corrupting <SEG> tags as tag count climbs, even when text is short enough
+# to fit comfortably within the token budget by itself.
+MAX_SEGMENTS_PER_CHUNK = 40
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +34,11 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 3)
 
 
-def build_chunks(segments: list[Segment], token_budget: int = 3000) -> list[list[Segment]]:
+def build_chunks(
+    segments: list[Segment],
+    token_budget: int = 3000,
+    max_segments: int = MAX_SEGMENTS_PER_CHUNK,
+) -> list[list[Segment]]:
     chunks: list[list[Segment]] = []
     current: list[Segment] = []
     current_tokens = 0
@@ -52,7 +60,7 @@ def build_chunks(segments: list[Segment], token_budget: int = 3000) -> list[list
             chunks.append([seg])
             continue
 
-        if current and current_tokens + cost > token_budget:
+        if current and (current_tokens + cost > token_budget or len(current) >= max_segments):
             chunks.append(current)
             current = []
             current_tokens = 0

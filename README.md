@@ -50,6 +50,7 @@ Options:
 | `--output PATH` | Output file path (default: `{stem}.{target_lang}{ext}` next to the input) |
 | `--config PATH` | Path to a config YAML file (default: `config/default.yaml`) |
 | `--chunk-tokens N` | Token budget per LLM request (default: 3000) |
+| `--max-segments-per-chunk N` | Max segments per chunk regardless of token budget (default: 40) |
 | `--max-retries N` | Retries per chunk on transport errors or malformed responses (default: 3) |
 | `--on-error {abort,skip}` | `abort` the whole run, or `skip` a failed chunk and leave its segments untranslated (default: `abort`) |
 | `--temperature FLOAT` | Sampling temperature |
@@ -79,6 +80,16 @@ pytest
 The suite runs fully offline against a fake, deterministic LLM client — no network or API keys
 required. Provider-specific behavior (error wrapping, response parsing) is tested against
 mocked transports in `tests/test_llm_providers_mocked.py`.
+
+## Notes on small/local models
+
+The `<SEG id="...">` tags sent to the LLM use short per-chunk numeric ids (`1`, `2`, ...), not
+the segments' internal UUIDs — small local models (e.g. a 3B Ollama model) reliably corrupt long
+hex strings when asked to copy dozens of them back verbatim, which fails the response validation.
+Segments are also capped at `--max-segments-per-chunk` (default 40) per request regardless of
+token budget, since tag-count tracking degrades with weaker models well before the token budget
+is exhausted. If you still see `chunk N failed: missing=[...] extra=[...]` errors with a small
+model, lower `--max-segments-per-chunk` further (e.g. to 15-20) or switch to a larger model.
 
 ## Known v1 limitations
 

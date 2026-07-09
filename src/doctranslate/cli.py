@@ -40,6 +40,11 @@ def translate(
     output: Optional[Path] = typer.Option(None, "--output", help="Output file path"),
     config_path: Optional[Path] = typer.Option(None, "--config", help="Path to a config YAML file"),
     chunk_tokens: Optional[int] = typer.Option(None, "--chunk-tokens", help="Token budget per chunk"),
+    max_segments_per_chunk: Optional[int] = typer.Option(
+        None,
+        "--max-segments-per-chunk",
+        help="Max segments per chunk regardless of token budget (lower this for small/local models)",
+    ),
     max_retries: Optional[int] = typer.Option(None, "--max-retries", help="Retries per chunk"),
     on_error: Optional[str] = typer.Option(None, "--on-error", help="abort or skip"),
     temperature: Optional[float] = typer.Option(None, "--temperature"),
@@ -63,9 +68,10 @@ def translate(
 
     settings = load_settings(str(config_path) if config_path else None)
     resolved_chunk_tokens = chunk_tokens or settings.get("chunk_token_budget", 3000)
+    resolved_max_segments = max_segments_per_chunk or settings.get("max_segments_per_chunk", 40)
 
     if dry_run:
-        stats = dry_run_stats(str(input_path), resolved_chunk_tokens)
+        stats = dry_run_stats(str(input_path), resolved_chunk_tokens, resolved_max_segments)
         typer.echo(f"doc_type: {stats['doc_type']}")
         typer.echo(f"segments: {stats['segment_count']}")
         typer.echo(f"chunks: {stats['chunk_count']}")
@@ -87,6 +93,7 @@ def translate(
             client,
             output_path=str(output) if output else None,
             chunk_token_budget=resolved_chunk_tokens,
+            max_segments_per_chunk=resolved_max_segments,
             max_retries=max_retries or settings.get("max_retries", 3),
             on_error=resolved_on_error,
             output_pattern=settings.get("output_pattern", "{stem}.{target_lang}{ext}"),

@@ -1,17 +1,19 @@
 from docx import Document
 
+from ..docx_utils import build_field_protection_map, iter_body_paragraphs, paragraph_text
 from ..models import ExtractionResult, Segment
 
 
 def extract(path: str) -> ExtractionResult:
     doc = Document(path)
+    protection = build_field_protection_map(doc)
     segments: list[Segment] = []
     refs: dict[str, object] = {}
     order = 0
 
     def add_segment(paragraph, group_key: str) -> None:
         nonlocal order
-        text = paragraph.text
+        text = paragraph_text(paragraph, protection)
         if not text.strip():
             return
         seg = Segment(doc_type="docx", source_text=text, group_key=group_key, order_hint=order)
@@ -19,7 +21,7 @@ def extract(path: str) -> ExtractionResult:
         segments.append(seg)
         refs[seg.id] = paragraph
 
-    for para in doc.paragraphs:
+    for para in iter_body_paragraphs(doc):
         add_segment(para, "body")
 
     for t_idx, table in enumerate(doc.tables):

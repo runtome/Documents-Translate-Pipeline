@@ -26,5 +26,7 @@ def build_system_prompt(source_lang: str, target_lang: str, glossary_block: str 
     )
 
 
-def build_user_prompt(chunk_segments: list[Segment]) -> str:
-    return "\n".join(f'<SEG id="{seg.id}">{seg.source_text}</SEG>' for seg in chunk_segments)
+def build_user_prompt(chunk_segments: list[Segment], aliases: list[str]) -> str:
+    return "\n".join(
+        f'<SEG id="{alias}">{seg.source_text}</SEG>' for alias, seg in zip(aliases, chunk_segments)
+    )

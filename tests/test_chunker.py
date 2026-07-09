@@ -34,3 +34,11 @@ def test_build_chunks_oversized_segment_gets_its_own_chunk():
     chunks = build_chunks([huge, normal], token_budget=100)
 
     assert any(chunk == [huge] for chunk in chunks)
+
+
+def test_build_chunks_caps_segment_count_even_within_token_budget():
+    segments = [make_segment("short", order_hint=i) for i in range(100)]
+    chunks = build_chunks(segments, token_budget=100_000, max_segments=40)
+
+    assert len(chunks) == 3
+    assert [len(chunk) for chunk in chunks] == [40, 40, 20]
